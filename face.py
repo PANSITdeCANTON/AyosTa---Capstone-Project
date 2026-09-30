@@ -23,6 +23,8 @@ NOTES FOR THE TEAM WITH BETTER HARDWARE
 """
 
 import os
+import queue
+import threading
 import time
 from dataclasses import dataclass
 
@@ -33,7 +35,7 @@ from ultralytics import YOLO
 # Configuration
 # ---------------------------------------------------------------------------
 
-WEIGHTS_PATH = "src/yolov8n-face.pt"  # TODO: confirm source and license of this file. ##AGPL-3.0 License: Free to use for personal, academic, and open-source projects. However, under copyleft rules, if you modify the code or deploy a service using it over a network, you must open-source your entire application under the same AGPL-3.0 terms.
+WEIGHTS_PATH = "src/yolov8n-face.pt"  # TODO: confirm source and license of this file.
 CAMERA_INDEX = 0                  # Webcam index. Replace with a video file path to test offline.
 TRACKER_CONFIG = "bytetrack.yaml" # Bundled with ultralytics. "botsort.yaml" is the alternative.
 
@@ -290,6 +292,120 @@ def run() -> None:
         # Always release the camera, even after an exception or Ctrl+C.
         capture.release()
         cv2.destroyAllWindows()
+
+
+# ---------------------------------------------------------------------------
+# GUI integration: background worker used by main.py
+# ---------------------------------------------------------------------------
+
+class FaceWorker(threading.Thread):
+    """
+    Live camera + tracking loop on a background thread, so a GUI stays responsive.
+
+    main.py reads worker.frames (only the NEWEST annotated BGR frame is kept) and
+    calls lock_largest() / unlock(). If something fails (missing weights, camera
+    busy), the message is stored in worker.error instead of crashing the GUI.
+
+    run() above is the console version of the same loop and is left untouched.
+    TODO(cleanup): rebuild run() on top of this class to remove the duplicated loop.
+    """
+
+    def __init__(self, weights_path: str = WEIGHTS_PATH, source=CAMERA_INDEX):
+        super().__init__(daemon=True)
+        self.frames = queue.Queue(maxsize=1)
+        self.error = None
+        self._weights_path = weights_path
+        self._source = source
+        self._commands = queue.Queue()
+        self._stop_event = threading.Event()
+        self._locked_id = None
+        self._lock_pending = False  # "lock" was requested but no face was visible yet
+
+    # Called from the GUI thread ------------------------------------------------
+
+    def lock_largest(self) -> None:
+        self._commands.put("lock")
+
+    def unlock(self) -> None:
+        self._commands.put("unlock")
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self.is_alive():
+            self.join(timeout=3.0)  # Lets the camera release before a new session starts.
+
+    # Worker thread ---------------------------------------------------------------
+
+    def run(self) -> None:
+        capture = None
+        try:
+            model = load_model(self._weights_path)
+            capture = open_camera(self._source)
+            previous_time = time.monotonic()
+            smoothed_fps = 0.0
+
+            while not self._stop_event.is_set():
+                success, frame = capture.read()
+                if not success:
+                    self.error = "No frame received from the camera."
+                    break
+
+                observations = detect_and_track(model, frame)
+                self._apply_commands(observations)
+                self._analyze_locked_face(frame, observations)
+
+                current_time = time.monotonic()
+                elapsed = max(current_time - previous_time, 1e-6)
+                previous_time = current_time
+                instant_fps = 1.0 / elapsed
+                smoothed_fps = (
+                    instant_fps if smoothed_fps == 0.0
+                    else FPS_SMOOTHING * smoothed_fps + (1 - FPS_SMOOTHING) * instant_fps
+                )
+
+                draw_overlay(frame, observations, self._locked_id, smoothed_fps)
+                self._offer_frame(frame)
+        except Exception as error:  # Broad on purpose: report to the GUI instead of dying silently.
+            self.error = f"{type(error).__name__}: {error}"
+        finally:
+            if capture is not None:
+                capture.release()
+
+    def _apply_commands(self, observations: list) -> None:
+        while True:
+            try:
+                command = self._commands.get_nowait()
+            except queue.Empty:
+                break
+            if command == "lock":
+                self._lock_pending = True
+            elif command == "unlock":
+                self._lock_pending = False
+                self._locked_id = None
+
+        if self._lock_pending:
+            target = pick_largest(observations)
+            if target is not None:
+                self._locked_id = target.track_id
+                self._lock_pending = False
+
+    def _analyze_locked_face(self, frame, observations: list) -> None:
+        if self._locked_id is None:
+            return
+        locked = next((obs for obs in observations if obs.track_id == self._locked_id), None)
+        if locked is None:
+            return  # TODO(stage2): re-acquire policy, see the note in run().
+        face_crop = crop_face(frame, locked.box)
+        if face_crop is not None:
+            publish_result(analyze_motion(face_crop, locked))
+
+    def _offer_frame(self, frame) -> None:
+        """Replace any unread frame so the GUI always gets the newest one."""
+        try:
+            self.frames.get_nowait()
+        except queue.Empty:
+            pass
+        self.frames.put_nowait(frame)
 
 
 if __name__ == "__main__":
