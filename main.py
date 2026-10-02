@@ -17,6 +17,7 @@ objects from the other modules, polls their queues, and draws what they return:
     audio.py     AudioRecorder   live mic + waveform data  (starts on Start session)
     speech.py    SpeechWorker    live words for the transcript
     language.py  translate_long  runs AFTER the session, on the Translate button
+    syscheck.py  run_all_checks  Settings window: PC requirements and installed packages
 
 Every module is imported lazily and started independently, so a missing package or
 device (no mic, no weights file) disables that panel only, not the whole app.
@@ -27,12 +28,16 @@ Keys:  L = lock largest face, U = unlock
 """
 
 import queue
+import sys
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox, ttk
 
 import numpy as np
 from PIL import Image, ImageTk
+
+import syscheck  # Standard library only, so importing it is always safe.
 
 # --- Behavior ----------------------------------------------------------------
 LIVE_WAVE_SECONDS = 10      # Live view shows the last N seconds. After Stop, the full recording.
@@ -56,14 +61,224 @@ MUTED = "#8a8f98"
 WAVE_COLOR = "#3ddc97"
 WAVE_CENTER_LINE = "#2a2f38"
 LIVE_COLOR = "#ff5c5c"
+WARN_COLOR = "#f5b942"
+
+# Settings window: how check results are shown.
+STATUS_LABELS = {"ok": "OK", "warn": "WARN", "fail": "FAIL", "skip": "--"}
+STATUS_COLORS = {"ok": WAVE_COLOR, "warn": WARN_COLOR, "fail": LIVE_COLOR, "skip": MUTED}
+
+
+class SettingsWindow(tk.Toplevel):
+    """
+    Settings: PC requirements and installed packages.
+    This class only DISPLAYS results. All checking logic lives in syscheck.py and runs on a
+    worker thread, so the window stays responsive during slow checks.
+    """
+
+    def __init__(self, app: tk.Tk, is_session_active):
+        super().__init__(app)
+        self.title("Settings")
+        self.geometry("920x660")
+        self.minsize(700, 500)
+        self.configure(bg=BG)
+        self.transient(app)
+
+        self._is_session_active = is_session_active   # Callable. Camera test is skipped if True.
+        self._events = queue.Queue()                  # Worker thread -> window.
+        self._results = []
+        self._row_results = {}                        # Tree row id -> CheckResult.
+        self._busy = False
+        self._after_id = None
+
+        self._build()
+        self._start(deep=False)
+        self._after_id = self.after(100, self._poll)
+
+    # ------------------------------------------------------------------ layout
+
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        header = tk.Frame(self, bg=BG)
+        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        self.summary = tk.Label(header, text="Checking...", bg=BG, fg=TEXT, anchor="w",
+                                font=("Segoe UI", 13, "bold"))
+        self.summary.pack(fill="x")
+        tk.Label(header, text=f"Python: {sys.executable}", bg=BG, fg=MUTED, anchor="w",
+                 font=("Segoe UI", 9)).pack(fill="x")
+
+        body = tk.Frame(self, bg=BG)
+        body.grid(row=1, column=0, sticky="nsew", padx=12)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(body, columns=("status", "detail"), show="tree headings",
+                                 selectmode="browse")
+        self.tree.heading("#0", text="Check", anchor="w")
+        self.tree.heading("status", text="Status")
+        self.tree.heading("detail", text="Detail", anchor="w")
+        self.tree.column("#0", width=270, stretch=False)
+        self.tree.column("status", width=70, stretch=False, anchor="center")
+        self.tree.column("detail", width=500)
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        for status, color in STATUS_COLORS.items():
+            self.tree.tag_configure(status, foreground=color)
+        self.tree.tag_configure("group", foreground=TEXT, font=("Segoe UI", 10, "bold"))
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        lower = tk.Frame(self, bg=BG)
+        lower.grid(row=2, column=0, sticky="ew", padx=12, pady=(8, 0))
+        lower.columnconfigure(0, weight=1)
+        self.detail_box = self._readonly_text(lower, height=3)
+        self.detail_box.grid(row=0, column=0, sticky="ew")
+        tk.Label(lower, text="To install what is missing (PowerShell, one line each):",
+                 bg=BG, fg=MUTED, anchor="w", font=("Segoe UI", 9)).grid(
+                     row=1, column=0, sticky="w", pady=(8, 2))
+        self.install_box = self._readonly_text(lower, height=4, mono=True)
+        self.install_box.grid(row=2, column=0, sticky="ew")
+
+        bar = ttk.Frame(self, style="Bar.TFrame")
+        bar.grid(row=3, column=0, sticky="ew", padx=12, pady=12)
+        self.recheck_button = ttk.Button(bar, text="Re-check", command=lambda: self._start(False))
+        self.deep_button = ttk.Button(bar, text="Deep check (slow)", command=lambda: self._start(True))
+        self.copy_button = ttk.Button(bar, text="Copy install commands", command=self._copy)
+        close_button = ttk.Button(bar, text="Close", command=self.destroy)
+        self.note = ttk.Label(bar, text="", style="Bar.TLabel")
+        self.recheck_button.pack(side="left", padx=(6, 2), pady=4)
+        self.deep_button.pack(side="left", padx=2, pady=4)
+        self.copy_button.pack(side="left", padx=2, pady=4)
+        close_button.pack(side="right", padx=(2, 6), pady=4)
+        self.note.pack(side="right", padx=10)
+
+    def _readonly_text(self, parent: tk.Misc, height: int, mono: bool = False) -> tk.Text:
+        return tk.Text(parent, height=height, wrap="word", state="disabled", bg=PANEL, fg=TEXT,
+                       relief="flat", padx=10, pady=6, highlightthickness=0,
+                       font=("Consolas", 10) if mono else ("Segoe UI", 10))
+
+    @staticmethod
+    def _set_text(box: tk.Text, text: str) -> None:
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        box.insert("1.0", text)
+        box.configure(state="disabled")
+
+    # ---------------------------------------------------------------- running
+
+    def _start(self, deep: bool) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        for button in (self.recheck_button, self.deep_button, self.copy_button):
+            button.state(["disabled"])
+        self.note.configure(text="")
+        self.summary.configure(text="Checking...", fg=TEXT)
+        threading.Thread(target=self._worker, args=(deep,), daemon=True).start()
+
+    def _worker(self, deep: bool) -> None:
+        """Runs on a worker thread. Talks to the window through the queue only."""
+        try:
+            results = syscheck.run_all_checks(
+                project_dir=Path(__file__).resolve().parent,
+                deep=deep,
+                session_active=self._is_session_active(),
+                progress=lambda message: self._events.put(("progress", message)),
+            )
+            self._events.put(("done", results))
+        except Exception as error:  # Broad on purpose: show the reason instead of hanging.
+            self._events.put(("error", f"{type(error).__name__}: {error}"))
+
+    def _poll(self) -> None:
+        while True:
+            try:
+                kind, payload = self._events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "progress":
+                self.summary.configure(text=payload, fg=TEXT)
+            elif kind == "done":
+                self._show(payload)
+                self._finish()
+            elif kind == "error":
+                self.summary.configure(text="The check itself failed", fg=LIVE_COLOR)
+                self._set_text(self.detail_box, payload)
+                self._finish()
+        self._after_id = self.after(100, self._poll)
+
+    def _finish(self) -> None:
+        self._busy = False
+        for button in (self.recheck_button, self.deep_button, self.copy_button):
+            button.state(["!disabled"])
+
+    # ---------------------------------------------------------------- results
+
+    def _show(self, results: list) -> None:
+        self._results = results
+        self._row_results = {}
+        self.tree.delete(*self.tree.get_children())
+
+        order = ["ok", "skip", "warn", "fail"]   # Worst status wins on a group row.
+        groups = {}
+        for result in results:
+            if result.group not in groups:
+                node = self.tree.insert("", "end", text=result.group, open=True, tags=("group",))
+                groups[result.group] = [node, "ok"]
+            group = groups[result.group]
+            if order.index(result.status) > order.index(group[1]):
+                group[1] = result.status
+            row = self.tree.insert(group[0], "end", text=result.name,
+                                   values=(STATUS_LABELS[result.status], result.detail),
+                                   tags=(result.status,))
+            self._row_results[row] = result
+        for node, worst in groups.values():
+            self.tree.set(node, "status", STATUS_LABELS[worst])
+
+        problems, warnings = syscheck.summarize(results)
+        if problems:
+            self.summary.configure(text=f"{problems} problem(s), {warnings} warning(s)", fg=LIVE_COLOR)
+        elif warnings:
+            self.summary.configure(text=f"No problems, {warnings} warning(s)", fg=WARN_COLOR)
+        else:
+            self.summary.configure(text="All checks passed", fg=WAVE_COLOR)
+
+        commands = syscheck.install_commands(results)
+        self._set_text(self.install_box, "\n".join(commands) if commands else "Nothing to install.")
+        self._set_text(self.detail_box, "Select a row to see its full detail and suggested fix.")
+
+    def _on_select(self, event=None) -> None:
+        selection = self.tree.selection()
+        result = self._row_results.get(selection[0]) if selection else None
+        if result is None:
+            return
+        text = result.detail + (f"\nFix: {result.fix}" if result.fix else "")
+        self._set_text(self.detail_box, text)
+
+    def _copy(self) -> None:
+        commands = syscheck.install_commands(self._results)
+        if not commands:
+            self.note.configure(text="Nothing to copy.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(commands))
+        self.note.configure(text="Copied.")
+
+    def destroy(self) -> None:
+        if self._after_id is not None:
+            try:
+                self.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+        super().destroy()
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("AyosTa")
-        self.geometry("1180x740")
-        self.minsize(800, 560)
+        self.geometry("1280x760")
+        self.minsize(1000, 560)
         self.configure(bg=BG)
 
         # Session parts. Each is None when it is not running or failed to start.
@@ -78,6 +293,7 @@ class App(tk.Tk):
         self._wave_key = None       # Skips redraws when nothing changed.
         self._reported_errors = set()
         self._last_speech_state = None
+        self._settings_window = None
         self._translation_queue = queue.Queue()
 
         self._build_style()
@@ -119,6 +335,14 @@ class App(tk.Tk):
         style.configure("TSeparator", background=BUTTON)
         style.configure("Status.TLabel", background=BG, foreground=MUTED,
                         font=("Segoe UI", 9))
+        style.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT,
+                        borderwidth=0, rowheight=26, bordercolor=PANEL,
+                        lightcolor=PANEL, darkcolor=PANEL)
+        style.map("Treeview", background=[("selected", BUTTON_HOVER)],
+                  foreground=[("selected", TEXT)])
+        style.configure("Treeview.Heading", background=BAR, foreground=MUTED,
+                        borderwidth=0, relief="flat")
+        style.map("Treeview.Heading", background=[("active", BAR)])
         self.option_add("*TCombobox*Listbox.background", PANEL)
         self.option_add("*TCombobox*Listbox.foreground", TEXT)
 
@@ -180,6 +404,7 @@ class App(tk.Tk):
                                      values=list(DIRECTIONS), width=20)
         self.translate_button = ttk.Button(toolbar, text="Translate transcript",
                                            command=self._translate)
+        self.settings_button = ttk.Button(toolbar, text="Settings", command=self._open_settings)
         self.status = tk.StringVar(value="Ready")
         status_label = ttk.Label(self, textvariable=self.status, style="Status.TLabel")
         status_label.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 6))
@@ -198,6 +423,7 @@ class App(tk.Tk):
         divider()
         direction_box.pack(side="left", padx=2, pady=4)
         self.translate_button.pack(side="left", padx=2, pady=4)
+        self.settings_button.pack(side="right", padx=(2, 6), pady=4)
 
     def _refresh_buttons(self) -> None:
         def set_enabled(button: ttk.Button, enabled: bool) -> None:
@@ -328,6 +554,14 @@ class App(tk.Tk):
     def _unlock_face(self) -> None:
         if self.face_worker is not None:
             self.face_worker.unlock()
+
+    def _open_settings(self) -> None:
+        window = self._settings_window
+        if window is not None and window.winfo_exists():
+            window.lift()
+            window.focus_force()
+            return
+        self._settings_window = SettingsWindow(self, lambda: self.session_active)
 
     def _on_close(self) -> None:
         if self.session_active:
