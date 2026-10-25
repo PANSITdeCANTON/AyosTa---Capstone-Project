@@ -1,760 +1,452 @@
 """
-main.py - GUI ONLY (Tkinter). ROUGH DRAFT, untested with a real camera and mic.
+main.py - AyosTa application controller and entry point.
 
-Layout (from the mockup, plus a slim toolbar that the mockup did not have):
+The controller coordinates the view (gui.py) and feature modules. Importing this
+file does not open the camera or microphone. Speech model initialization is warmed
+in a background thread while the GUI opens; devices are only activated when the
+user starts a session.
 
-    +----------------+----------------+
-    |     video      |                |
-    +----------------+   transcript   |
-    |   audio wave   |                |
-    +----------------+----------------+
-    [Start] [Stop] | [Lock] [Unlock] | [direction] [Translate]      status
-
-This file holds NO detection, audio, speech or translation logic. It starts worker
-objects from the other modules, polls their queues, and draws what they return:
-
-    face.py      FaceWorker      live video frames         (starts on Start session)
-    audio.py     AudioRecorder   live mic + waveform data  (starts on Start session)
-    speech.py    SpeechWorker    live words for the transcript
-    language.py  translate_long  runs AFTER the session, on the Translate button
-    syscheck.py  run_all_checks  Settings window: PC requirements and installed packages
-
-Every module is imported lazily and started independently, so a missing package or
-device (no mic, no weights file) disables that panel only, not the whole app.
-Worker threads never touch Tk. They talk to the GUI through queues only.
-
-Needs: pip install pillow numpy   (pillow arrives with ultralytics)
-Keys:  L = lock largest face, U = unlock
+Run with: py main.py
 """
 
+from __future__ import annotations
+
 import queue
-import sys
 import threading
-import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from typing import Any, Callable
 
 import numpy as np
-from PIL import Image, ImageTk
 
-import syscheck  # Standard library only, so importing it is always safe.
-
-# --- Behavior ----------------------------------------------------------------
-LIVE_WAVE_SECONDS = 10      # Live view shows the last N seconds. After Stop, the full recording.
-WAVE_DISPLAY_GAIN = 3.0     # Vertical zoom for DISPLAY only. Stored samples are never changed.
-VIDEO_POLL_MS = 20
-SLOW_POLL_MS = 60           # Waveform, transcript, errors, translation results.
 DIRECTIONS = {
     "Cebuano to Tagalog": ("Cebuano", "Tagalog"),
     "Tagalog to Cebuano": ("Tagalog", "Cebuano"),
 }
-SPEAKING = {"Cebuano": "ceb", "Tagalog": "tgl"}   # Language spoken in the session -> MMS code.
-
-# --- Colors ------------------------------------------------------------------
-BG = "#16181d"
-PANEL = "#0e0f12"
-BAR = "#1e2128"
-BUTTON = "#2b303a"
-BUTTON_HOVER = "#39404d"
-TEXT = "#e6e6e6"
-MUTED = "#8a8f98"
-WAVE_COLOR = "#3ddc97"
-WAVE_CENTER_LINE = "#2a2f38"
-LIVE_COLOR = "#ff5c5c"
-WARN_COLOR = "#f5b942"
-
-# Settings window: how check results are shown.
-STATUS_LABELS = {"ok": "OK", "warn": "WARN", "fail": "FAIL", "skip": "--"}
-STATUS_COLORS = {"ok": WAVE_COLOR, "warn": WARN_COLOR, "fail": LIVE_COLOR, "skip": MUTED}
+SPEAKING = {"Cebuano": "ceb", "Tagalog": "tgl"}
 
 
-class SettingsWindow(tk.Toplevel):
-    """
-    Settings: PC requirements and installed packages.
-    This class only DISPLAYS results. All checking logic lives in syscheck.py and runs on a
-    worker thread, so the window stays responsive during slow checks.
-    """
+class Controller:
+    """Coordinate workers, background tasks, exports, and GUI-facing state."""
 
-    def __init__(self, app: tk.Tk, is_session_active):
-        super().__init__(app)
-        self.title("Settings")
-        self.geometry("920x660")
-        self.minsize(700, 500)
-        self.configure(bg=BG)
-        self.transient(app)
+    DIRECTIONS = DIRECTIONS
+    SPEAKING = SPEAKING
 
-        self._is_session_active = is_session_active   # Callable. Camera test is skipped if True.
-        self._events = queue.Queue()                  # Worker thread -> window.
-        self._results = []
-        self._row_results = {}                        # Tree row id -> CheckResult.
-        self._busy = False
-        self._after_id = None
-
-        self._build()
-        self._start(deep=False)
-        self._after_id = self.after(100, self._poll)
-
-    # ------------------------------------------------------------------ layout
-
-    def _build(self) -> None:
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
-
-        header = tk.Frame(self, bg=BG)
-        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
-        self.summary = tk.Label(header, text="Checking...", bg=BG, fg=TEXT, anchor="w",
-                                font=("Segoe UI", 13, "bold"))
-        self.summary.pack(fill="x")
-        tk.Label(header, text=f"Python: {sys.executable}", bg=BG, fg=MUTED, anchor="w",
-                 font=("Segoe UI", 9)).pack(fill="x")
-
-        body = tk.Frame(self, bg=BG)
-        body.grid(row=1, column=0, sticky="nsew", padx=12)
-        body.columnconfigure(0, weight=1)
-        body.rowconfigure(0, weight=1)
-        self.tree = ttk.Treeview(body, columns=("status", "detail"), show="tree headings",
-                                 selectmode="browse")
-        self.tree.heading("#0", text="Check", anchor="w")
-        self.tree.heading("status", text="Status")
-        self.tree.heading("detail", text="Detail", anchor="w")
-        self.tree.column("#0", width=270, stretch=False)
-        self.tree.column("status", width=70, stretch=False, anchor="center")
-        self.tree.column("detail", width=500)
-        scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        for status, color in STATUS_COLORS.items():
-            self.tree.tag_configure(status, foreground=color)
-        self.tree.tag_configure("group", foreground=TEXT, font=("Segoe UI", 10, "bold"))
-        self.tree.bind("<<TreeviewSelect>>", self._on_select)
-
-        lower = tk.Frame(self, bg=BG)
-        lower.grid(row=2, column=0, sticky="ew", padx=12, pady=(8, 0))
-        lower.columnconfigure(0, weight=1)
-        self.detail_box = self._readonly_text(lower, height=3)
-        self.detail_box.grid(row=0, column=0, sticky="ew")
-        tk.Label(lower, text="To install what is missing (PowerShell, one line each):",
-                 bg=BG, fg=MUTED, anchor="w", font=("Segoe UI", 9)).grid(
-                     row=1, column=0, sticky="w", pady=(8, 2))
-        self.install_box = self._readonly_text(lower, height=4, mono=True)
-        self.install_box.grid(row=2, column=0, sticky="ew")
-
-        bar = ttk.Frame(self, style="Bar.TFrame")
-        bar.grid(row=3, column=0, sticky="ew", padx=12, pady=12)
-        self.recheck_button = ttk.Button(bar, text="Re-check", command=lambda: self._start(False))
-        self.deep_button = ttk.Button(bar, text="Deep check (slow)", command=lambda: self._start(True))
-        self.copy_button = ttk.Button(bar, text="Copy install commands", command=self._copy)
-        close_button = ttk.Button(bar, text="Close", command=self.destroy)
-        self.note = ttk.Label(bar, text="", style="Bar.TLabel")
-        self.recheck_button.pack(side="left", padx=(6, 2), pady=4)
-        self.deep_button.pack(side="left", padx=2, pady=4)
-        self.copy_button.pack(side="left", padx=2, pady=4)
-        close_button.pack(side="right", padx=(2, 6), pady=4)
-        self.note.pack(side="right", padx=10)
-
-    def _readonly_text(self, parent: tk.Misc, height: int, mono: bool = False) -> tk.Text:
-        return tk.Text(parent, height=height, wrap="word", state="disabled", bg=PANEL, fg=TEXT,
-                       relief="flat", padx=10, pady=6, highlightthickness=0,
-                       font=("Consolas", 10) if mono else ("Segoe UI", 10))
-
-    @staticmethod
-    def _set_text(box: tk.Text, text: str) -> None:
-        box.configure(state="normal")
-        box.delete("1.0", "end")
-        box.insert("1.0", text)
-        box.configure(state="disabled")
-
-    # ---------------------------------------------------------------- running
-
-    def _start(self, deep: bool) -> None:
-        if self._busy:
-            return
-        self._busy = True
-        for button in (self.recheck_button, self.deep_button, self.copy_button):
-            button.state(["disabled"])
-        self.note.configure(text="")
-        self.summary.configure(text="Checking...", fg=TEXT)
-        threading.Thread(target=self._worker, args=(deep,), daemon=True).start()
-
-    def _worker(self, deep: bool) -> None:
-        """Runs on a worker thread. Talks to the window through the queue only."""
-        try:
-            results = syscheck.run_all_checks(
-                project_dir=Path(__file__).resolve().parent,
-                deep=deep,
-                session_active=self._is_session_active(),
-                progress=lambda message: self._events.put(("progress", message)),
-            )
-            self._events.put(("done", results))
-        except Exception as error:  # Broad on purpose: show the reason instead of hanging.
-            self._events.put(("error", f"{type(error).__name__}: {error}"))
-
-    def _poll(self) -> None:
-        while True:
-            try:
-                kind, payload = self._events.get_nowait()
-            except queue.Empty:
-                break
-            if kind == "progress":
-                self.summary.configure(text=payload, fg=TEXT)
-            elif kind == "done":
-                self._show(payload)
-                self._finish()
-            elif kind == "error":
-                self.summary.configure(text="The check itself failed", fg=LIVE_COLOR)
-                self._set_text(self.detail_box, payload)
-                self._finish()
-        self._after_id = self.after(100, self._poll)
-
-    def _finish(self) -> None:
-        self._busy = False
-        for button in (self.recheck_button, self.deep_button, self.copy_button):
-            button.state(["!disabled"])
-
-    # ---------------------------------------------------------------- results
-
-    def _show(self, results: list) -> None:
-        self._results = results
-        self._row_results = {}
-        self.tree.delete(*self.tree.get_children())
-
-        order = ["ok", "skip", "warn", "fail"]   # Worst status wins on a group row.
-        groups = {}
-        for result in results:
-            if result.group not in groups:
-                node = self.tree.insert("", "end", text=result.group, open=True, tags=("group",))
-                groups[result.group] = [node, "ok"]
-            group = groups[result.group]
-            if order.index(result.status) > order.index(group[1]):
-                group[1] = result.status
-            row = self.tree.insert(group[0], "end", text=result.name,
-                                   values=(STATUS_LABELS[result.status], result.detail),
-                                   tags=(result.status,))
-            self._row_results[row] = result
-        for node, worst in groups.values():
-            self.tree.set(node, "status", STATUS_LABELS[worst])
-
-        problems, warnings = syscheck.summarize(results)
-        if problems:
-            self.summary.configure(text=f"{problems} problem(s), {warnings} warning(s)", fg=LIVE_COLOR)
-        elif warnings:
-            self.summary.configure(text=f"No problems, {warnings} warning(s)", fg=WARN_COLOR)
-        else:
-            self.summary.configure(text="All checks passed", fg=WAVE_COLOR)
-
-        commands = syscheck.install_commands(results)
-        self._set_text(self.install_box, "\n".join(commands) if commands else "Nothing to install.")
-        self._set_text(self.detail_box, "Select a row to see its full detail and suggested fix.")
-
-    def _on_select(self, event=None) -> None:
-        selection = self.tree.selection()
-        result = self._row_results.get(selection[0]) if selection else None
-        if result is None:
-            return
-        text = result.detail + (f"\nFix: {result.fix}" if result.fix else "")
-        self._set_text(self.detail_box, text)
-
-    def _copy(self) -> None:
-        commands = syscheck.install_commands(self._results)
-        if not commands:
-            self.note.configure(text="Nothing to copy.")
-            return
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(commands))
-        self.note.configure(text="Copied.")
-
-    def destroy(self) -> None:
-        if self._after_id is not None:
-            try:
-                self.after_cancel(self._after_id)
-            except tk.TclError:
-                pass
-        super().destroy()
-
-
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("AyosTa")
-        self.geometry("1280x760")
-        self.minsize(1000, 560)
-        self.configure(bg=BG)
-
-        # Session parts. Each is None when it is not running or failed to start.
+    def __init__(self) -> None:
+        self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.face_worker = None
-        self.recorder = None        # Kept after Stop so the full waveform stays visible.
+        self.recorder = None
         self.speech_worker = None
         self.session_active = False
         self.translating = False
+        self.speaking = "Cebuano"
+        self._words: list[str] = []
+        self._closed = False
+        self._devices_ready = False
+        self._translation_lock = threading.Lock()
+        self._preload_lock = threading.Lock()
+        self._speech_engine = None  # Keep the loaded engine for the app's full lifetime.
+        self._preload_error: str | None = None
 
-        self._words = []            # Live words only. Translation reads this, not the widget.
-        self._video_image = None    # Tk drops images that nothing references.
-        self._wave_key = None       # Skips redraws when nothing changed.
-        self._reported_errors = set()
-        self._last_speech_state = None
-        self._settings_window = None
-        self._translation_queue = queue.Queue()
-
-        self._build_style()
-        self._build_layout()
-        self._refresh_buttons()
-        self._draw_video_idle()
-
-        self.bind("<l>", lambda event: self._lock_face())
-        self.bind("<u>", lambda event: self._unlock_face())
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        self.after(VIDEO_POLL_MS, self._poll_video)
-        self.after(SLOW_POLL_MS, self._poll_slow)
-
-    # ------------------------------------------------------------------ layout
-
-    def _build_style(self) -> None:
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("Bar.TFrame", background=BAR)
-        style.configure("Bar.TLabel", background=BAR, foreground=MUTED)
-        style.configure("TButton", background=BUTTON, foreground=TEXT,
-                        borderwidth=0, focusthickness=0, padding=(12, 6))
-        style.map("TButton",
-                  background=[("disabled", BAR), ("active", BUTTON_HOVER)],
-                  foreground=[("disabled", MUTED)])
-        style.configure("TCombobox", fieldbackground=BUTTON, background=BUTTON,
-                        foreground=TEXT, arrowcolor=TEXT, borderwidth=0,
-                        bordercolor=BUTTON, lightcolor=BUTTON, darkcolor=BUTTON,
-                        selectbackground=BUTTON, selectforeground=TEXT)
-        style.map("TCombobox", fieldbackground=[("readonly", BUTTON)],
-                  foreground=[("readonly", TEXT)],
-                  selectbackground=[("readonly", BUTTON)],
-                  selectforeground=[("readonly", TEXT)])
-        style.configure("Vertical.TScrollbar", background=BUTTON, troughcolor=PANEL,
-                        bordercolor=PANEL, lightcolor=BUTTON, darkcolor=BUTTON,
-                        borderwidth=0, arrowcolor=TEXT)
-        style.map("Vertical.TScrollbar", background=[("active", BUTTON_HOVER)])
-        style.configure("TSeparator", background=BUTTON)
-        style.configure("Status.TLabel", background=BG, foreground=MUTED,
-                        font=("Segoe UI", 9))
-        style.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT,
-                        borderwidth=0, rowheight=26, bordercolor=PANEL,
-                        lightcolor=PANEL, darkcolor=PANEL)
-        style.map("Treeview", background=[("selected", BUTTON_HOVER)],
-                  foreground=[("selected", TEXT)])
-        style.configure("Treeview.Heading", background=BAR, foreground=MUTED,
-                        borderwidth=0, relief="flat")
-        style.map("Treeview.Heading", background=[("active", BAR)])
-        self.option_add("*TCombobox*Listbox.background", PANEL)
-        self.option_add("*TCombobox*Listbox.foreground", TEXT)
-
-    def _build_layout(self) -> None:
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
-
-        content = tk.Frame(self, bg=BG)
-        content.grid(row=0, column=0, sticky="nsew", padx=6, pady=(6, 0))
-        content.rowconfigure(0, weight=1)
-        content.columnconfigure((0, 1), weight=1, uniform="columns")
-
-        # Left column: video on top, waveform below, equal height.
-        left = tk.Frame(content, bg=BG)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
-        left.columnconfigure(0, weight=1)
-        left.rowconfigure((0, 1), weight=1, uniform="rows")
-
-        self.video_canvas = tk.Canvas(left, bg=PANEL, highlightthickness=0)
-        self.video_canvas.grid(row=0, column=0, sticky="nsew", pady=(0, 3))
-        self.video_canvas.bind("<Configure>", self._on_video_resize)
-
-        self.wave_canvas = tk.Canvas(left, bg=PANEL, highlightthickness=0)
-        self.wave_canvas.grid(row=1, column=0, sticky="nsew", pady=(3, 0))
-
-        # Right column: transcript, full height.
-        right = tk.Frame(content, bg=BG)
-        right.grid(row=0, column=1, sticky="nsew", padx=(3, 0))
-        right.columnconfigure(0, weight=1)
-        right.rowconfigure(0, weight=1)
-
-        self.transcript = tk.Text(
-            right, wrap="word", state="disabled", bg=PANEL, fg=TEXT,
-            relief="flat", padx=14, pady=12, font=("Segoe UI", 11),
-            highlightthickness=0,
+        self.events.put(("status", "Opening AyosTa. Loading models and starting live previews..."))
+        self._preload_thread = threading.Thread(
+            target=self._preload_speech_engine, name="speech-model-preload", daemon=True
         )
-        self.transcript.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(right, orient="vertical", command=self.transcript.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.transcript.configure(yscrollcommand=scrollbar.set)
-        self.transcript.tag_configure("divider", foreground=MUTED, spacing1=10, spacing3=6)
-        self.transcript.tag_configure("translation", foreground=WAVE_COLOR)
+        self._preload_thread.start()
+        self._device_thread = threading.Thread(
+            target=self._start_preview_devices, name="preview-devices-startup", daemon=True
+        )
+        self._device_thread.start()
 
-        # Toolbar.
-        toolbar = ttk.Frame(self, style="Bar.TFrame")
-        toolbar.grid(row=1, column=0, sticky="ew", padx=6, pady=6)
+    def _preload_speech_engine(self) -> None:
+        """Load the actual speech model before a session starts."""
+        try:
+            from speech import MMSEngine
 
-        self.start_button = ttk.Button(toolbar, text="Start session", command=self._start_session)
-        self.stop_button = ttk.Button(toolbar, text="Stop session", command=self._stop_session)
-        self.lock_button = ttk.Button(toolbar, text="Lock face (L)", command=self._lock_face)
-        self.unlock_button = ttk.Button(toolbar, text="Unlock (U)", command=self._unlock_face)
-        self.speaking = tk.StringVar(value=next(iter(SPEAKING)))
-        speaking_label = ttk.Label(toolbar, text="Speaking", style="Bar.TLabel")
-        speaking_box = ttk.Combobox(toolbar, textvariable=self.speaking, state="readonly",
-                                    values=list(SPEAKING), width=9)
-        speaking_box.bind("<<ComboboxSelected>>", self._on_speaking_changed)
-        self.direction = tk.StringVar(value=next(iter(DIRECTIONS)))
-        direction_box = ttk.Combobox(toolbar, textvariable=self.direction, state="readonly",
-                                     values=list(DIRECTIONS), width=20)
-        self.translate_button = ttk.Button(toolbar, text="Translate transcript",
-                                           command=self._translate)
-        self.settings_button = ttk.Button(toolbar, text="Settings", command=self._open_settings)
-        self.status = tk.StringVar(value="Ready")
-        status_label = ttk.Label(self, textvariable=self.status, style="Status.TLabel")
-        status_label.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 6))
+            engine = MMSEngine(language=self.SPEAKING[self.speaking])
 
-        def divider() -> None:
-            tk.Frame(toolbar, width=1, bg=BUTTON).pack(side="left", fill="y", padx=8, pady=6)
+            # This loads the real model weights and processor.
+            engine.load()
 
-        self.start_button.pack(side="left", padx=(6, 2), pady=4)
-        self.stop_button.pack(side="left", padx=2, pady=4)
-        divider()
-        self.lock_button.pack(side="left", padx=2, pady=4)
-        self.unlock_button.pack(side="left", padx=2, pady=4)
-        divider()
-        speaking_label.pack(side="left", padx=(2, 4), pady=4)
-        speaking_box.pack(side="left", padx=2, pady=4)
-        divider()
-        direction_box.pack(side="left", padx=2, pady=4)
-        self.translate_button.pack(side="left", padx=2, pady=4)
-        self.settings_button.pack(side="right", padx=(2, 6), pady=4)
+            with self._preload_lock:
+                if not self._closed:
+                    self._speech_engine = engine
 
-    def _refresh_buttons(self) -> None:
-        def set_enabled(button: ttk.Button, enabled: bool) -> None:
-            button.state(["!disabled"] if enabled else ["disabled"])
+            self.events.put((
+                "status",
+                "Speech model loaded and ready. Preparing live preview..."
+            ))
 
-        idle = not self.session_active and not self.translating and not self._finishing_speech()
-        face_live = self.session_active and self.face_worker is not None
-        set_enabled(self.start_button, idle)
-        set_enabled(self.stop_button, self.session_active)
-        set_enabled(self.lock_button, face_live)
-        set_enabled(self.unlock_button, face_live)
-        set_enabled(self.translate_button, idle and bool(self._words))
+        except Exception as error:
+            self._preload_error = f"{type(error).__name__}: {error}"
+            self.events.put(("error", ("Speech", self._preload_error)))
+            self.events.put((
+                "status",
+                "Speech model failed to load. Check the error message."
+            ))
+            
+    def load(self) -> None:
+        if self._model is not None:
+            return  # Already loaded; reuse the model.
 
-    # ----------------------------------------------------------------- session
 
-    def _start_session(self) -> None:
-        # A new session replaces the previous transcript and recording.
-        self._clear_transcript()
-        self._words = []
-        self._reported_errors = set()
-        self._last_speech_state = None
-        self._wave_key = None
+    def _start_preview_devices(self) -> None:
+        """Start camera and microphone once. They remain open between sessions."""
+        problems: list[str] = []
+        try:
+            from face import FaceWorker
+            worker = FaceWorker()
+            worker.start()
+            if self._closed:
+                worker.stop()
+            else:
+                self.face_worker = worker
+        except Exception as error:
+            problems.append(f"Camera: {type(error).__name__}: {error}")
 
-        problems = []
-        self.face_worker = self._try_start("Video", self._make_face_worker, problems)
-        self.recorder = self._try_start("Audio", self._make_recorder, problems)
-        self.speech_worker = None
-        if self.recorder is not None:
-            self.speech_worker = self._try_start("Speech", self._make_speech_worker, problems)
+        try:
+            from audio import AudioRecorder
+            recorder = AudioRecorder()
+            recorder.start()
+            if self._closed:
+                recorder.stop()
+            else:
+                self.recorder = recorder
+        except Exception as error:
+            problems.append(f"Microphone: {type(error).__name__}: {error}")
 
         if problems:
-            messagebox.showwarning("Some parts could not start", "\n\n".join(problems))
-        if self.face_worker is None and self.recorder is None:
-            self.status.set("Nothing could start")
-            self._refresh_buttons()
+            self.events.put(("problems", problems))
+        self._devices_ready = True
+        self.events.put(("status", self._preview_status()))
+
+    @property
+    def camera_on(self) -> bool:
+        # Camera preview is independent of whether a session is recording.
+        return self.face_worker is not None
+
+    @property
+    def can_start_session(self) -> bool:
+        worker_busy = self.speech_worker is not None and self.speech_worker.is_alive()
+        return (not self._closed and self._devices_ready and not self.session_active
+                and not self.translating and not worker_busy)
+
+    @property
+    def can_translate(self) -> bool:
+        return (
+            not self._closed and not self.session_active and not self.translating
+            and bool(self._words) and self.speech_worker is None
+        )
+
+    @property
+    def has_audio(self) -> bool:
+        recorder = self.recorder
+        return bool(recorder is not None and recorder.buffer.length > 0)
+
+    def start_session(self) -> None:
+        """Enable session retention/transcription without restarting camera or mic."""
+        if not self.can_start_session:
             return
+        if self.recorder is None and self.face_worker is None:
+            self.events.put(("status", "Preview devices are unavailable. Check Settings."))
+            return
+
+        self._words.clear()
+        self.events.put(("transcript_cleared", None))
+        self.events.put(("session", None))
+        if self.recorder is not None:
+            try:
+                self.recorder.start_recording()
+            except Exception as error:
+                self.events.put(("error", ("Audio", str(error))))
 
         self.session_active = True
-        self._set_running_status()
-        self._refresh_buttons()
+        self.events.put(("status", self._running_status()))
+        if self.recorder is not None:
+            threading.Thread(
+                target=self._start_speech_background, name="speech-worker-startup", daemon=True
+            ).start()
+        elif self.face_worker is not None:
+            self.events.put(("problems", ["Microphone unavailable; session has video only."]))
 
-    def _try_start(self, label: str, factory, problems: list):
-        """Start one part. On failure, record why and carry on without it."""
+    def _start_speech_background(self) -> None:
+        """Start a per-session worker using the already-loaded speech engine."""
+        try:
+            from speech import SpeechWorker, MMSEngine
+            self._preload_thread.join()
+            if self._closed or not self.session_active or self.recorder is None:
+                return
+
+            # Never overlap speech workers: a stopped worker may still be flushing its final words.
+            previous = self.speech_worker
+            if previous is not None and previous.is_alive():
+                previous.join()
+            if self._closed or not self.session_active or self.recorder is None:
+                return
+
+            with self._preload_lock:
+                engine = self._speech_engine
+            if engine is None:
+                engine = MMSEngine(language=self.SPEAKING[self.speaking])
+                with self._preload_lock:
+                    self._speech_engine = engine
+            elif hasattr(engine, "set_language"):
+                engine.set_language(self.SPEAKING[self.speaking])
+
+            worker = SpeechWorker(self.recorder.chunks, engine=engine)
+            worker.start()
+            if self._closed or not self.session_active:
+                try:
+                    worker.request_stop()
+                except Exception:
+                    pass
+                return
+            self.speech_worker = worker
+            self.events.put(("status", self._running_status()))
+        except Exception as error:
+            self.events.put(("error", ("Speech", f"{type(error).__name__}: {error}")))
+            self.events.put(("status", "Session recording; speech recognition failed to start."))
+
+    def stop_session(self) -> None:
+        """End the current recording only; preview devices and model stay alive."""
+        if not self.session_active:
+            return
+        self.session_active = False
+        errors: list[str] = []
+        if self.recorder is not None:
+            try:
+                self.recorder.stop_recording()
+            except Exception as error:
+                errors.append(f"Audio: {type(error).__name__}: {error}")
+        worker = self.speech_worker
+        if worker is not None:
+            try:
+                worker.request_stop()
+            except Exception as error:
+                errors.append(f"Speech: {type(error).__name__}: {error}")
+        if errors:
+            self.events.put(("problems", errors))
+        self.events.put(("status", "Session stopped. Finishing transcript..." if worker else
+                         f"Session stopped. {len(self._words)} words captured."))
+        self.events.put(("session", None))
+
+    def _try_start(self, label: str, factory: Callable[[], Any], problems: list[str]):
         try:
             return factory()
-        except Exception as error:  # Broad on purpose: parts must fail independently.
-            problems.append(f"{label}: {error}")
+        except Exception as error:
+            problems.append(f"{label}: {type(error).__name__}: {error}")
             return None
 
-    def _make_face_worker(self):
-        from face import FaceWorker
-        worker = FaceWorker()
-        worker.start()
-        return worker
-
-    def _make_recorder(self):
-        from audio import AudioRecorder
-        recorder = AudioRecorder()
-        recorder.start()
-        return recorder
-
-    def _make_speech_worker(self):
-        from speech import MMSEngine, SpeechWorker
-        engine = MMSEngine(language=SPEAKING[self.speaking.get()])
-        worker = SpeechWorker(self.recorder.chunks, engine=engine)
-        worker.start()  # Loads the model on its own thread, so the window never freezes.
-        return worker
-
-    def _stop_session(self) -> None:
-        if self.face_worker is not None:
-            self.face_worker.stop()
-        if self.recorder is not None:
-            self.recorder.stop()
-        if self.speech_worker is not None:
-            # Non-blocking: the worker may still be loading or transcribing the last
-            # segment. _finish_speech_if_done() collects its final words later.
-            self.speech_worker.request_stop()
-
-        self.face_worker = None
-        self.session_active = False
-        self._wave_key = None
-        self._draw_video_idle()
-        if self.speech_worker is not None:
-            self.status.set("Session stopped. Finishing the transcript...")
-        else:
-            self.status.set(f"Session stopped. {len(self._words)} words in the transcript.")
-        self._refresh_buttons()
-
-    def _finishing_speech(self) -> bool:
-        """True while a stopped session's speech worker is still producing words."""
-        return self.speech_worker is not None and not self.session_active
-
-    def _finish_speech_if_done(self) -> None:
+    def set_speaking(self, language: str) -> None:
+        if language not in self.SPEAKING:
+            raise ValueError(f"Unsupported speaking language: {language}")
+        self.speaking = language
         worker = self.speech_worker
-        if worker is None or self.session_active or worker.is_alive():
-            return
-        self._drain_words()
-        self.speech_worker = None
-        self.status.set(f"Session stopped. {len(self._words)} words in the transcript.")
-        self._refresh_buttons()
+        if worker is not None and self.session_active:
+            try:
+                worker.set_language(self.SPEAKING[language])
+            except Exception as error:
+                self.events.put(("error", ("Speech", f"Could not change language: {error}")))
 
-    def _refresh_speech_status(self) -> None:
-        """Show model loading / listening without overwriting error messages."""
-        worker = self.speech_worker
-        if worker is None or worker.state == self._last_speech_state:
-            return
-        self._last_speech_state = worker.state
-        if self.session_active and not worker.error:
-            self._set_running_status()
+    def lock_face(self) -> None:
+        worker = self.face_worker
+        if worker is not None:
+            try:
+                worker.lock_largest()
+            except Exception as error:
+                self.events.put(("error", ("Video", str(error))))
 
-    def _on_speaking_changed(self, event=None) -> None:
-        language = self.speaking.get()
-        other = "Tagalog" if language == "Cebuano" else "Cebuano"
-        self.direction.set(f"{language} to {other}")  # Translate what was spoken.
-        if self.speech_worker is not None and self.session_active:
-            self.speech_worker.set_language(SPEAKING[language])
+    def unlock_face(self) -> None:
+        worker = self.face_worker
+        if worker is not None:
+            try:
+                worker.unlock()
+            except Exception as error:
+                self.events.put(("error", ("Video", str(error))))
 
-    def _set_running_status(self) -> None:
-        video = "video on" if self.face_worker else "video off"
-        audio = "audio on" if self.recorder else "audio off"
-        speech = f"speech: {self.speech_worker.state}" if self.speech_worker else "speech off"
-        self.status.set(f"Recording ({video}, {audio}, {speech})")
-
-    def _lock_face(self) -> None:
-        if self.face_worker is not None:
-            self.face_worker.lock_largest()
-
-    def _unlock_face(self) -> None:
-        if self.face_worker is not None:
-            self.face_worker.unlock()
-
-    def _open_settings(self) -> None:
-        window = self._settings_window
-        if window is not None and window.winfo_exists():
-            window.lift()
-            window.focus_force()
-            return
-        self._settings_window = SettingsWindow(self, lambda: self.session_active)
-
-    def _on_close(self) -> None:
-        if self.session_active:
-            self._stop_session()  # Non-blocking for speech. Daemon threads end with the app.
-        self.destroy()
-
-    # ------------------------------------------------------------ translation
-
-    def _translate(self) -> None:
-        text = " ".join(self._words).strip()
-        if not text:
-            self.status.set("Nothing to translate.")
-            return
-        source, target = DIRECTIONS[self.direction.get()]
-        self.translating = True
-        self._refresh_buttons()
-        self.status.set("Translating. The first run loads the model and can take a while.")
-        threading.Thread(target=self._translation_job, args=(text, source, target),
-                         daemon=True).start()
-
-    def _translation_job(self, text: str, source: str, target: str) -> None:
-        """Runs on a worker thread. Reports back through the queue only."""
+    def poll_frame(self):
+        worker = self.face_worker
+        if worker is None:
+            return None
         try:
-            from language import translate_long
-            result = translate_long(
-                text, source, target,
-                on_progress=lambda done, total: self._translation_queue.put(("progress", (done, total))),
-            )
-            self._translation_queue.put(("done", (result, source, target)))
-        except Exception as error:  # Broad on purpose: show the reason in the GUI.
-            self._translation_queue.put(("error", f"{type(error).__name__}: {error}"))
+            return worker.frames.get_nowait()
+        except queue.Empty:
+            return None
+        except Exception as error:
+            self.events.put(("error", ("Video", f"Could not read camera frame: {error}")))
+            return None
 
-    def _drain_translation(self) -> None:
+    def update(self) -> list[tuple[str, Any]]:
+        """Drain worker results; called by the GUI thread."""
+        updates: list[tuple[str, Any]] = []
         while True:
             try:
-                kind, payload = self._translation_queue.get_nowait()
-            except queue.Empty:
-                return
-            if kind == "progress":
-                done, total = payload
-                self.status.set(f"Translating: part {done} of {total}")
-            elif kind == "done":
-                result, source, target = payload
-                self._append_transcript(f"\n{source} to {target}\n", "divider")
-                self._append_transcript(result + "\n", "translation")
-                self.translating = False
-                self.status.set("Translation finished.")
-                self._refresh_buttons()
-            elif kind == "error":
-                self.translating = False
-                self.status.set("Translation failed.")
-                self._refresh_buttons()
-                messagebox.showerror("Translation failed", payload)
-
-    # -------------------------------------------------------------- transcript
-
-    def _clear_transcript(self) -> None:
-        self.transcript.configure(state="normal")
-        self.transcript.delete("1.0", "end")
-        self.transcript.configure(state="disabled")
-
-    def _append_transcript(self, text: str, tag: str = "") -> None:
-        self.transcript.configure(state="normal")
-        self.transcript.insert("end", text, tag)
-        self.transcript.see("end")
-        self.transcript.configure(state="disabled")
-
-    def _drain_words(self) -> None:
-        if self.speech_worker is None:
-            return
-        new_words = []
-        while True:
-            try:
-                new_words.append(self.speech_worker.words.get_nowait())
+                updates.append(self.events.get_nowait())
             except queue.Empty:
                 break
-        if new_words:
-            self._words.extend(new_words)
-            self._append_transcript(" ".join(new_words) + " ")
 
-    # ------------------------------------------------------------------- video
-
-    def _poll_video(self) -> None:
-        if self.face_worker is not None:
+        worker = self.speech_worker
+        if worker is not None:
             try:
-                frame = self.face_worker.frames.get_nowait()
+                while True:
+                    word = worker.words.get_nowait()
+                    if word:
+                        self._words.append(str(word))
+                        updates.append(("words", [str(word)]))
             except queue.Empty:
-                frame = None
-            if frame is not None:
-                self._show_frame(frame)
-        self.after(VIDEO_POLL_MS, self._poll_video)
+                pass
+            except Exception as error:
+                updates.append(("error", ("Speech", f"Could not read transcript: {error}")))
 
-    def _show_frame(self, frame: np.ndarray) -> None:
-        canvas = self.video_canvas
-        canvas_width, canvas_height = canvas.winfo_width(), canvas.winfo_height()
-        if canvas_width < 8 or canvas_height < 8:
-            return
-        height, width = frame.shape[:2]
-        scale = min(canvas_width / width, canvas_height / height)
-        size = (max(1, int(width * scale)), max(1, int(height * scale)))
-        image = Image.fromarray(frame[:, :, ::-1])  # OpenCV gives BGR, Tk needs RGB.
-        image = image.resize(size, Image.Resampling.BILINEAR)
-        self._video_image = ImageTk.PhotoImage(image)
-        canvas.delete("all")
-        canvas.create_image(canvas_width // 2, canvas_height // 2, image=self._video_image)
+            if not self.session_active and not worker.is_alive():
+                self.speech_worker = None
+                updates.append(("status", f"Session stopped. {len(self._words)} words captured. Preview remains active."))
 
-    def _on_video_resize(self, event) -> None:
-        if self.face_worker is None:
-            self._draw_video_idle()
+        return updates
 
-    def _draw_video_idle(self) -> None:
-        canvas = self.video_canvas
-        canvas.delete("all")
-        canvas.create_text(canvas.winfo_width() // 2, canvas.winfo_height() // 2,
-                           text="Video", fill=MUTED, font=("Segoe UI", 12))
-
-    # ---------------------------------------------------------------- waveform
-
-    def _poll_slow(self) -> None:
-        self._drain_words()
-        self._finish_speech_if_done()
-        self._refresh_speech_status()
-        self._redraw_wave()
-        self._check_worker_errors()
-        self._drain_translation()
-        self.after(SLOW_POLL_MS, self._poll_slow)
-
-    def _redraw_wave(self) -> None:
-        """
-        Editor-style waveform: one min/max pair per pixel column, drawn as a filled
-        envelope. Live = last LIVE_WAVE_SECONDS. After Stop = the whole recording.
-        TODO(team): zoom, scroll, selection, time ruler. The data side (audio.py)
-        already supports any range through AudioBuffer.peaks(start, end, columns).
-        """
-        canvas = self.wave_canvas
-        width, height = canvas.winfo_width(), canvas.winfo_height()
-        if width < 8 or height < 8:
-            return
-
+    def audio_state(self) -> tuple[int, int, bool]:
+        """Return sample count, rate, and session-recording state for the waveform."""
         recorder = self.recorder
-        total = recorder.buffer.length if recorder else 0
-        running = bool(recorder and recorder.is_running)
-        key = (width, height, total, running)
-        if key == self._wave_key:
-            return  # Nothing changed, so skip the work (matters for long stopped recordings).
-        self._wave_key = key
+        if recorder is None:
+            return 0, 16000, False
+        try:
+            active = bool(self.session_active and getattr(recorder, "is_recording", False))
+            if active or recorder.buffer.length > 0:
+                return int(recorder.buffer.length), int(recorder.sample_rate), active
+            return int(recorder.preview_buffer.length), int(recorder.sample_rate), False
+        except Exception:
+            return 0, 16000, False
 
-        canvas.delete("all")
-        middle = height // 2
-        canvas.create_line(0, middle, width, middle, fill=WAVE_CENTER_LINE)
+    def audio_peaks(self, start: int, end: int, columns: int):
+        recorder = self.recorder
+        if recorder is None or columns <= 0 or end <= start:
+            return np.zeros(0), np.zeros(0)
+        if self.session_active or recorder.buffer.length > 0:
+            return recorder.buffer.peaks(start, end, columns)
+        return recorder.preview_buffer.peaks(start, end, columns)
 
-        if recorder is None or total == 0:
-            label = "Audio waveform" if recorder is None else "Waiting for audio..."
-            canvas.create_text(width // 2, middle - 14, text=label, fill=MUTED,
-                               font=("Segoe UI", 12))
+    def translate(self, direction: str) -> bool:
+        if not self.can_translate:
+            return False
+        text = " ".join(self._words).strip()
+        if not text:
+            return False
+        if direction not in self.DIRECTIONS:
+            self.events.put(("translation_error", f"Unsupported translation direction: {direction}"))
+            return False
+
+        source, target = self.DIRECTIONS[direction]
+        self.translating = True
+        self.events.put(("status", "Translating. The first run may take a while..."))
+        threading.Thread(
+            target=self._translation_job,
+            args=(text, source, target),
+            name="translation-worker",
+            daemon=True,
+        ).start()
+        return True
+
+    def _translation_job(self, text: str, source: str, target: str) -> None:
+        try:
+            from language import translate_long
+
+            result = translate_long(
+                text,
+                source,
+                target,
+                on_progress=lambda done, total: self.events.put(
+                    ("translation_progress", (done, total))
+                ),
+            )
+            self.events.put(("translation", (result, source, target)))
+        except Exception as error:
+            self.events.put(("translation_error", f"{type(error).__name__}: {error}"))
+        finally:
+            self.translating = False
+
+    def save_audio(self, path: str | Path) -> None:
+        recorder = self.recorder
+        if recorder is None:
+            raise ValueError("There is no recording to save.")
+        samples = recorder.buffer.snapshot(0, recorder.buffer.length)
+        if samples is None or len(samples) == 0:
+            raise ValueError("There is no recorded session audio to save yet.")
+        sample_rate = int(recorder.sample_rate)
+        from exports import save_wav
+
+        save_wav(path, samples, sample_rate)
+
+    def export_pdf(self, path: str | Path, transcript_text: str) -> None:
+        from exports import export_transcript_pdf
+
+        export_transcript_pdf(path, transcript_text)
+
+    def run_checks(self, deep: bool = False, progress=None):
+        import syscheck
+
+        return syscheck.run_all_checks(
+            project_dir=Path(__file__).resolve().parent,
+            deep=deep,
+            session_active=self.session_active,
+            progress=progress,
+        )
+
+    @staticmethod
+    def summarize_checks(results):
+        import syscheck
+
+        return syscheck.summarize(results)
+
+    @staticmethod
+    def install_commands(results):
+        import syscheck
+
+        return syscheck.install_commands(results)
+
+    def _preview_status(self) -> str:
+        video = "camera preview on" if self.face_worker is not None else "camera unavailable"
+        audio = "mic preview on" if self.recorder is not None else "mic unavailable"
+        with self._preload_lock:
+            model_ready = self._speech_engine is not None
+        model = "speech model ready" if model_ready else "speech model loading"
+        return f"Preview ready ({video}, {audio}; {model}). Click Start Session to record."
+
+    def _running_status(self) -> str:
+        video = "video on" if self.face_worker is not None else "video off"
+        audio = "recording" if self.recorder is not None else "audio off"
+        speech_state = getattr(self.speech_worker, "state", "starting")
+        return f"Session recording ({video}, {audio}, speech: {speech_state})"
+
+    def shutdown(self) -> None:
+        if self._closed:
             return
+        self._closed = True
+        if self.session_active:
+            self.stop_session()
+        # Only application shutdown closes devices and releases the retained model.
+        for worker, method_name in (
+            (self.face_worker, "stop"),
+            (self.recorder, "stop"),
+            (self.speech_worker, "request_stop"),
+        ):
+            if worker is not None:
+                try:
+                    getattr(worker, method_name)()
+                except Exception:
+                    pass
+        self.face_worker = None
+        self.recorder = None
+        self.speech_worker = None
+        self._speech_engine = None
 
-        window = int(recorder.sample_rate * LIVE_WAVE_SECONDS)
-        if running:
-            start = max(0, total - window)
-            span = max(2, int(width * min(total, window) / window))
-        else:
-            start = 0
-            span = width
 
-        mins, maxs = recorder.buffer.peaks(start, total, span)
-        count = len(mins)
-        if count < 2:
-            return
+def main() -> None:
+    from gui import App
 
-        scale = height / 2 - 6
-        top = middle - np.clip(maxs * WAVE_DISPLAY_GAIN, -1.0, 1.0) * scale
-        bottom = middle - np.clip(mins * WAVE_DISPLAY_GAIN, -1.0, 1.0) * scale
-        xs = np.arange(count) * (span / count)
-        outline = np.vstack((np.column_stack((xs, top)),
-                             np.column_stack((xs, bottom))[::-1]))
-        canvas.create_polygon(outline.ravel().tolist(), fill=WAVE_COLOR, outline="")
-
-        seconds = total / recorder.sample_rate
-        text = f"LIVE  {seconds:.1f}s" if running else f"Stopped  {seconds:.1f}s"
-        canvas.create_text(10, 8, anchor="nw", text=text, font=("Segoe UI", 9),
-                           fill=LIVE_COLOR if running else MUTED)
-
-    # ------------------------------------------------------------------ errors
-
-    def _check_worker_errors(self) -> None:
-        for label, worker in (("Video", self.face_worker), ("Speech", self.speech_worker)):
-            if worker is None or not worker.error or label in self._reported_errors:
-                continue
-            self._reported_errors.add(label)
-            self.status.set(f"{label} stopped: {worker.error}")
-            messagebox.showerror(f"{label} problem", worker.error)
+    controller = Controller()
+    app = App(controller)
+    app.mainloop()
+    controller.shutdown()
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    main()
