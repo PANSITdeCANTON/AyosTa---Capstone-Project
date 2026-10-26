@@ -187,11 +187,19 @@ class AudioRecorder:
         self.preview_buffer.append(samples)
         with self._state_lock:
             recording = self._recording
-        if not recording:
-            return
-        self.buffer.append(samples)
+        if recording:
+            self.buffer.append(samples)
+
+        # Feed live speech recognition during preview and during session recording.
+        # If overloaded, discard the oldest chunk so recognition does not lag far behind.
         try:
             self.chunks.put_nowait(samples)
         except queue.Full:
-            # Preserve realtime responsiveness; the buffer still retains the raw audio.
-            pass
+            try:
+                self.chunks.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.chunks.put_nowait(samples)
+            except queue.Full:
+                pass

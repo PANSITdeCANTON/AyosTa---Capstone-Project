@@ -17,6 +17,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+import os
+from pathlib import Path
+
+PROJECT_DIR = Path(__file__).resolve().parent
+MODEL_CACHE = PROJECT_DIR / "models_cache"
+
+os.environ["HF_HOME"] = str(MODEL_CACHE)
+os.environ["HF_HUB_CACHE"] = str(MODEL_CACHE / "hub")
 
 DIRECTIONS = {
     "Cebuano to Tagalog": ("Cebuano", "Tagalog"),
@@ -58,36 +66,20 @@ class Controller:
         self._device_thread.start()
 
     def _preload_speech_engine(self) -> None:
-        """Load the actual speech model before a session starts."""
+        """Load the speech model once, in the background, before a session is requested."""
         try:
             from speech import MMSEngine
-
             engine = MMSEngine(language=self.SPEAKING[self.speaking])
-
-            # This loads the real model weights and processor.
+            # Load weights before the persistent speech worker starts.
             engine.load()
-
             with self._preload_lock:
                 if not self._closed:
                     self._speech_engine = engine
-
-            self.events.put((
-                "status",
-                "Speech model loaded and ready. Preparing live preview..."
-            ))
-
+            self.events.put(("status", "Speech model loaded. Preparing live preview..."))
         except Exception as error:
             self._preload_error = f"{type(error).__name__}: {error}"
             self.events.put(("error", ("Speech", self._preload_error)))
-            self.events.put((
-                "status",
-                "Speech model failed to load. Check the error message."
-            ))
-            
-    def load(self) -> None:
-        if self._model is not None:
-            return  # Already loaded; reuse the model.
-
+            self.events.put(("status", "Preview starting. Speech model could not be preloaded."))
 
     def _start_preview_devices(self) -> None:
         """Start camera and microphone once. They remain open between sessions."""
@@ -119,6 +111,14 @@ class Controller:
         self._devices_ready = True
         self.events.put(("status", self._preview_status()))
 
+        # Start live recognition automatically once the microphone/model are ready.
+        if self.recorder is not None and not self._closed:
+            threading.Thread(
+                target=self._start_speech_background,
+                name="speech-worker-startup",
+                daemon=True,
+            ).start()
+
     @property
     def camera_on(self) -> bool:
         # Camera preview is independent of whether a session is recording.
@@ -126,15 +126,21 @@ class Controller:
 
     @property
     def can_start_session(self) -> bool:
-        worker_busy = self.speech_worker is not None and self.speech_worker.is_alive()
-        return (not self._closed and self._devices_ready and not self.session_active
-                and not self.translating and not worker_busy)
+        # A live speech worker is expected to remain active between sessions.
+        return (
+            not self._closed
+            and self._devices_ready
+            and not self.session_active
+            and not self.translating
+        )
 
     @property
     def can_translate(self) -> bool:
         return (
-            not self._closed and not self.session_active and not self.translating
-            and bool(self._words) and self.speech_worker is None
+            not self._closed
+            and not self.session_active
+            and not self.translating
+            and bool(self._words)
         )
 
     @property
@@ -161,50 +167,61 @@ class Controller:
 
         self.session_active = True
         self.events.put(("status", self._running_status()))
-        if self.recorder is not None:
-            threading.Thread(
-                target=self._start_speech_background, name="speech-worker-startup", daemon=True
-            ).start()
-        elif self.face_worker is not None:
+        if self.recorder is None and self.face_worker is not None:
             self.events.put(("problems", ["Microphone unavailable; session has video only."]))
 
     def _start_speech_background(self) -> None:
-        """Start a per-session worker using the already-loaded speech engine."""
+        """Start one persistent speech worker for the lifetime of the application."""
         try:
-            from speech import SpeechWorker, MMSEngine
+            from speech import MMSEngine, SpeechWorker
+
+            # This method runs on a daemon thread, so waiting does not freeze Tk.
             self._preload_thread.join()
-            if self._closed or not self.session_active or self.recorder is None:
+            if self._closed:
                 return
 
-            # Never overlap speech workers: a stopped worker may still be flushing its final words.
-            previous = self.speech_worker
-            if previous is not None and previous.is_alive():
-                previous.join()
-            if self._closed or not self.session_active or self.recorder is None:
+            recorder = self.recorder
+            if recorder is None:
                 return
+
+            # Do not create a second worker if startup was triggered more than once.
+            previous = self.speech_worker
+            if previous is not None:
+                if previous.is_alive():
+                    return
+                self.speech_worker = None
 
             with self._preload_lock:
                 engine = self._speech_engine
+
             if engine is None:
                 engine = MMSEngine(language=self.SPEAKING[self.speaking])
+                engine.load()
                 with self._preload_lock:
+                    if self._closed:
+                        return
                     self._speech_engine = engine
             elif hasattr(engine, "set_language"):
                 engine.set_language(self.SPEAKING[self.speaking])
 
-            worker = SpeechWorker(self.recorder.chunks, engine=engine)
-            worker.start()
-            if self._closed or not self.session_active:
+            # Discard audio captured while the model was loading.
+            while True:
                 try:
-                    worker.request_stop()
-                except Exception:
-                    pass
+                    recorder.chunks.get_nowait()
+                except queue.Empty:
+                    break
+
+            if self._closed:
                 return
+
+            worker = SpeechWorker(recorder.chunks, engine=engine)
             self.speech_worker = worker
-            self.events.put(("status", self._running_status()))
+            worker.start()
+            self.events.put(("status", "Live speech recognition is running. Start Session to save a recording."))
+
         except Exception as error:
             self.events.put(("error", ("Speech", f"{type(error).__name__}: {error}")))
-            self.events.put(("status", "Session recording; speech recognition failed to start."))
+            self.events.put(("status", "Live speech recognition failed to start."))
 
     def stop_session(self) -> None:
         """End the current recording only; preview devices and model stay alive."""
@@ -217,16 +234,10 @@ class Controller:
                 self.recorder.stop_recording()
             except Exception as error:
                 errors.append(f"Audio: {type(error).__name__}: {error}")
-        worker = self.speech_worker
-        if worker is not None:
-            try:
-                worker.request_stop()
-            except Exception as error:
-                errors.append(f"Speech: {type(error).__name__}: {error}")
+        # Keep speech recognition running; only session recording is stopped here.
         if errors:
             self.events.put(("problems", errors))
-        self.events.put(("status", "Session stopped. Finishing transcript..." if worker else
-                         f"Session stopped. {len(self._words)} words captured."))
+        self.events.put(("status", f"Session stopped. {len(self._words)} words captured. Live recognition remains active."))
         self.events.put(("session", None))
 
     def _try_start(self, label: str, factory: Callable[[], Any], problems: list[str]):
@@ -241,7 +252,7 @@ class Controller:
             raise ValueError(f"Unsupported speaking language: {language}")
         self.speaking = language
         worker = self.speech_worker
-        if worker is not None and self.session_active:
+        if worker is not None and worker.is_alive():
             try:
                 worker.set_language(self.SPEAKING[language])
             except Exception as error:
@@ -297,9 +308,9 @@ class Controller:
             except Exception as error:
                 updates.append(("error", ("Speech", f"Could not read transcript: {error}")))
 
-            if not self.session_active and not worker.is_alive():
+            if not worker.is_alive() and not self._closed:
                 self.speech_worker = None
-                updates.append(("status", f"Session stopped. {len(self._words)} words captured. Preview remains active."))
+                updates.append(("status", "Speech recognition stopped unexpectedly. Restart AyosTa to retry."))
 
         return updates
 
@@ -408,7 +419,7 @@ class Controller:
         with self._preload_lock:
             model_ready = self._speech_engine is not None
         model = "speech model ready" if model_ready else "speech model loading"
-        return f"Preview ready ({video}, {audio}; {model}). Click Start Session to record."
+        return f"Preview ready ({video}, {audio}; {model}). Live speech recognition starts automatically; click Start Session to save audio."
 
     def _running_status(self) -> str:
         video = "video on" if self.face_worker is not None else "video off"

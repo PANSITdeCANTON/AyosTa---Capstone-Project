@@ -8,6 +8,9 @@ __pycache__/
 
 # Distribution / packaging
 __pycache__/
+hub/
+xet/
+.agent_harnesses.json
 .Python
 build/
 develop-eggs/
