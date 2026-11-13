@@ -1,0 +1,138 @@
+[
+  {
+    "id": "10/27/2026 23:42",
+    "iso_date": "2026-10-27",
+    "date": "Oct 27",
+    "parties": "asd vs. asd",
+    "complainant": "asd",
+    "respondent": "asd",
+    "problem": "asd",
+    "status": "open",
+    "language": "Cebuano",
+    "duration_seconds": 14.8,
+    "transcript": [
+      {
+        "speaker": "Complainant",
+        "text": "ap pi g a m o"
+      }
+    ],
+    "translation": "",
+    "status_history": []
+  },
+  {
+    "id": "10/27/2026 13:58",
+    "iso_date": "2026-10-27",
+    "date": "Oct 27",
+    "parties": "asd vs. asd",
+    "complainant": "asd",
+    "respondent": "asd",
+    "problem": "asd",
+    "status": "open",
+    "language": "Cebuano",
+    "duration_seconds": 4.2,
+    "transcript": [
+      {
+        "speaker": "Complainant",
+        "text": "pipiii piiip iipiipi"
+      }
+    ],
+    "translation": "",
+    "status_history": []
+  },
+  {
+    "id": "10/27/2026 05:42",
+    "iso_date": "2026-10-27",
+    "date": "Oct 27",
+    "parties": "asd vs. asd",
+    "complainant": "asd",
+    "respondent": "asd",
+    "problem": "asd",
+    "status": "closed",
+    "language": "Cebuano",
+    "duration_seconds": 6.4,
+    "transcript": [],
+    "translation": "",
+    "status_history": []
+  },
+  {
+    "id": "10/27/2026 05:41",
+    "iso_date": "2026-10-27",
+    "date": "Oct 27",
+    "parties": "dasd vs. asd",
+    "complainant": "dasd",
+    "respondent": "asd",
+    "problem": "asdad",
+    "status": "court",
+    "language": "Cebuano",
+    "duration_seconds": 33.9,
+    "transcript": [
+      {
+        "speaker": "Complainant",
+        "text": "a iii i i a a in paa an in a a in ai ybapinneaocagconro abalo ka buko kay ka buko buoaalo"
+      }
+    ],
+    "translation": "",
+    "status_history": [
+      {
+        "from": "closed",
+        "to": "open",
+        "at": "2026-10-27T05:43:20"
+      },
+      {
+        "from": "open",
+        "to": "closed",
+        "at": "2026-10-27T05:43:20"
+      },
+      {
+        "from": "closed",
+        "to": "court",
+        "at": "2026-10-27T05:43:21"
+      }
+    ]
+  },
+  {
+    "id": "10/27/2026 05:27",
+    "iso_date": "2026-10-27",
+    "date": "Oct 27",
+    "parties": "Dian vs. Ian",
+    "complainant": "Dian",
+    "respondent": "Ian",
+    "problem": "Utang",
+    "status": "open",
+    "language": "Cebuano",
+    "duration_seconds": 77.4,
+    "transcript": [
+      {
+        "speaker": "Complainant",
+        "text": "a pa i an i a gi a g an ag a gag a g an pan a a a ai ma in a i i i ii a a a ana a a an lo alo oiy a o laka caa halo ibry on dis is iou ioso hao a"
+      },
+      {
+        "speaker": "Respondent",
+        "text": "a ikaw halo halo halo halo halo aalo a a aalo ba ka aa aa abalo baka aalo aaa pulos wakay pulos wad da a a"
+      }
+    ],
+    "translation": "",
+    "status_history": [
+      {
+        "from": "court",
+        "to": "closed",
+        "at": "2026-10-27T05:43:17"
+      },
+      {
+        "from": "closed",
+        "to": "open",
+        "at": "2026-10-27T05:43:19"
+      },
+      {
+        "from": "open",
+        "to": "closed",
+        "at": "2026-10-27T23:43:35"
+      },
+      {
+        "from": "closed",
+        "to": "open",
+        "at": "2026-10-27T23:43:36"
+      }
+    ]
+  }
+]

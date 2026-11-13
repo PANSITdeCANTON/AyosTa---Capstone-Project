@@ -1,141 +1,207 @@
-"""Persistent microphone capture with a preview waveform and session-only recording.
-
-The microphone stream is opened once when the application starts. While no session is
-active, a short rolling preview buffer is updated but audio is NOT saved to the session
-buffer and is NOT sent to speech recognition. start_recording()/stop_recording() only
-change the capture gate; they never close or reopen the microphone.
-
-Needs: pip install sounddevice numpy
 """
+audio.py - live microphone capture + waveform data.
 
-from __future__ import annotations
+What it provides
+    AudioBuffer    Every raw sample of the session (int16, mono), thread-safe.
+                   - peaks(): min/max per pixel column, the same method audio
+                     editors use to draw waveforms. Cheap even for long recordings.
+                   - snapshot(): a copy of the raw samples for real analysis
+                     (RMS, FFT, silence detection, and so on).
+
+    AudioRecorder  Opens the mic, applies optional input amplification,
+                   fills the buffer, and forwards each chunk to a queue
+                   that the speech worker reads.
+
+Needs:
+    pip install sounddevice numpy
+
+Notes:
+    INPUT_GAIN amplifies the captured microphone signal in software.
+    It does not increase the physical sensitivity of the microphone.
+"""
 
 import queue
 import threading
 
 import numpy as np
 
+
 SAMPLE_RATE = 16000
 CHANNELS = 1
+
+# Roughly a minute of chunks.
+# When full, NEW chunks are dropped.
 CHUNK_QUEUE_SIZE = 3000
+
+# Buffer pre-allocation.
+# It doubles automatically when full.
 INITIAL_SECONDS = 60
-PREVIEW_SECONDS = 10
+
+# Microphone sensitivity / software amplification.
+#
+# 1.0 = original microphone level
+# 1.5 = slightly louder
+# 2.0 = twice the amplitude
+# 3.0 = three times the amplitude
+#
+# Be careful with high values because they can cause clipping.
+INPUT_GAIN = 2.0
+
+
 _EMPTY = np.zeros(0, dtype=np.float32)
 
 
 class AudioBuffer:
-    """Thread-safe int16 sample buffer, optionally retaining only the latest N seconds."""
+    """Growing int16 store of the whole recording session."""
 
-    def __init__(self, sample_rate: int = SAMPLE_RATE, max_seconds: float | None = None):
+    def __init__(self, sample_rate: int = SAMPLE_RATE):
         self.sample_rate = sample_rate
-        self.max_samples = int(sample_rate * max_seconds) if max_seconds else None
-        capacity = self.max_samples or INITIAL_SECONDS * sample_rate
-        self._data = np.zeros(max(1, capacity), dtype=np.int16)
+
+        self._data = np.zeros(
+            INITIAL_SECONDS * sample_rate,
+            dtype=np.int16,
+        )
+
         self._length = 0
         self._lock = threading.Lock()
 
     @property
     def length(self) -> int:
+        """Return the number of samples currently stored."""
         with self._lock:
             return self._length
 
-    def clear(self) -> None:
-        with self._lock:
-            self._length = 0
-
     def append(self, samples: np.ndarray) -> None:
-        samples = np.asarray(samples, dtype=np.int16).reshape(-1)
+        """Append microphone samples to the recording buffer."""
         count = len(samples)
+
         if count == 0:
             return
-        with self._lock:
-            if self.max_samples is not None:
-                limit = self.max_samples
-                if count >= limit:
-                    self._data[:limit] = samples[-limit:]
-                    self._length = limit
-                    return
-                overflow = max(0, self._length + count - limit)
-                if overflow:
-                    remaining = self._length - overflow
-                    if remaining > 0:
-                        self._data[:remaining] = self._data[overflow:self._length]
-                    self._length = remaining
-                self._data[self._length:self._length + count] = samples
-                self._length += count
-                return
 
+        with self._lock:
             needed = self._length + count
+
             if needed > len(self._data):
-                grown = np.zeros(max(needed, len(self._data) * 2), dtype=np.int16)
+                new_size = max(
+                    needed,
+                    len(self._data) * 2,
+                )
+
+                grown = np.zeros(
+                    new_size,
+                    dtype=np.int16,
+                )
+
                 grown[:self._length] = self._data[:self._length]
                 self._data = grown
+
             self._data[self._length:needed] = samples
             self._length = needed
 
     def snapshot(self, start: int = 0, end=None) -> np.ndarray:
+        """
+        Return a copy of raw samples in the range [start, end).
+
+        Use this for:
+            - RMS
+            - FFT
+            - silence detection
+            - speech analysis
+        """
         with self._lock:
-            end = self._length if end is None else min(int(end), self._length)
-            start = max(0, int(start))
-            if end <= start:
-                return np.zeros(0, dtype=np.int16)
+            start = max(0, start)
+
+            if end is None:
+                end = self._length
+            else:
+                end = min(end, self._length)
+
+            if start >= end:
+                return _EMPTY.copy()
+
             return self._data[start:end].copy()
 
     def peaks(self, start: int, end: int, columns: int):
+        """
+        Return minimum and maximum values for each waveform column.
+
+        The returned values are normalized to approximately [-1.0, 1.0].
+        """
         with self._lock:
-            end = min(int(end), self._length)
-            start = max(0, int(start))
+            end = min(end, self._length)
+            start = max(0, start)
+
             count = end - start
+
             if count <= 0 or columns < 1:
                 return _EMPTY, _EMPTY
-            columns = min(int(columns), count)
-            # Include every sample, including the remainder in the final bucket.
-            edges = np.linspace(start, end, columns + 1, dtype=np.int64)
-            mins = np.empty(columns, dtype=np.float32)
-            maxs = np.empty(columns, dtype=np.float32)
-            for i in range(columns):
-                left, right = int(edges[i]), max(int(edges[i + 1]), int(edges[i]) + 1)
-                view = self._data[left:min(right, end)]
-                mins[i] = view.min() / 32768.0
-                maxs[i] = view.max() / 32768.0
+
+            columns = min(columns, count)
+
+            bucket = count // columns
+
+            if bucket < 1:
+                return _EMPTY, _EMPTY
+
+            usable_count = bucket * columns
+
+            view = self._data[
+                start:start + usable_count
+            ].reshape(columns, bucket)
+
+            mins = view.min(axis=1) / 32768.0
+            maxs = view.max(axis=1) / 32768.0
+
             return mins, maxs
 
 
 class AudioRecorder:
-    """One persistent mic stream with separate preview and session recording buffers."""
+    """Capture microphone audio and store it in an AudioBuffer."""
 
-    def __init__(self, sample_rate: int = SAMPLE_RATE, device=None):
+    def __init__(
+        self,
+        sample_rate: int = SAMPLE_RATE,
+        device=None,
+        input_gain: float = INPUT_GAIN,
+    ):
         self.sample_rate = sample_rate
-        self.buffer = AudioBuffer(sample_rate)  # Recorded session only.
-        self.preview_buffer = AudioBuffer(sample_rate, max_seconds=PREVIEW_SECONDS)
-        self.chunks = queue.Queue(maxsize=CHUNK_QUEUE_SIZE)
+
+        self.buffer = AudioBuffer(sample_rate)
+
+        # Queue consumed by the speech worker.
+        self.chunks = queue.Queue(
+            maxsize=CHUNK_QUEUE_SIZE
+        )
+
+        # None means use the system default microphone.
         self._device = device
+
+        # Software microphone amplification.
+        self.input_gain = max(0.0, float(input_gain))
+
         self._stream = None
         self._running = False
-        self._recording = False
-        self._state_lock = threading.Lock()
 
     @property
     def is_running(self) -> bool:
+        """Return True when microphone recording is active."""
         return self._running
 
     @property
-    def is_recording(self) -> bool:
-        with self._state_lock:
-            return self._recording
-
-    @property
     def duration_seconds(self) -> float:
+        """Return the current recording duration in seconds."""
         return self.buffer.length / self.sample_rate
 
     def start(self) -> None:
-        """Open the mic stream once. Recording remains disabled until start_recording()."""
-        if self._running:
-            return
+        """Open and start the microphone."""
         try:
             import sounddevice
         except ImportError as error:
-            raise RuntimeError("sounddevice is not installed. Run: pip install sounddevice") from error
+            raise RuntimeError(
+                "sounddevice is not installed. "
+                "Run: pip install sounddevice"
+            ) from error
+
         try:
             self._stream = sounddevice.InputStream(
                 samplerate=self.sample_rate,
@@ -144,30 +210,30 @@ class AudioRecorder:
                 device=self._device,
                 callback=self._on_audio,
             )
+
             self._stream.start()
-            self._running = True
-        except (sounddevice.PortAudioError, ValueError) as error:
+
+        except (
+            sounddevice.PortAudioError,
+            ValueError,
+        ) as error:
             self._stream = None
-            raise RuntimeError(f"Could not open the microphone: {error}") from error
 
-    def start_recording(self) -> None:
-        """Begin a fresh session without restarting the microphone stream."""
-        if not self._running:
-            raise RuntimeError("The microphone is not running.")
-        self.buffer.clear()
-        self._drain_chunks()
-        with self._state_lock:
-            self._recording = True
+            raise RuntimeError(
+                f"Could not open the microphone: {error}"
+            ) from error
 
-    def stop_recording(self) -> None:
-        """Stop retaining/sending audio while leaving the microphone preview active."""
-        with self._state_lock:
-            self._recording = False
+        self._running = True
 
     def stop(self) -> None:
-        """Close the microphone stream; reserved for application shutdown."""
-        self.stop_recording()
+        """
+        Stop microphone capture.
+
+        The recorded buffer is kept so the complete waveform
+        can still be displayed or analyzed.
+        """
         self._running = False
+
         if self._stream is not None:
             try:
                 self._stream.stop()
@@ -175,31 +241,63 @@ class AudioRecorder:
                 self._stream.close()
                 self._stream = None
 
-    def _drain_chunks(self) -> None:
-        while True:
-            try:
-                self.chunks.get_nowait()
-            except queue.Empty:
-                return
+    def set_gain(self, gain: float) -> None:
+        """
+        Change the software microphone gain.
 
-    def _on_audio(self, indata, frames, time_info, status) -> None:
+        Examples:
+            recorder.set_gain(1.0)  # Original level
+            recorder.set_gain(2.0)  # 2x amplitude
+            recorder.set_gain(3.0)  # 3x amplitude
+        """
+        gain = float(gain)
+
+        if not np.isfinite(gain) or gain < 0:
+            raise ValueError(
+                "Input gain must be a finite number greater than or equal to 0."
+            )
+
+        self.input_gain = gain
+
+    def _on_audio(
+        self,
+        indata,
+        frames,
+        time_info,
+        status,
+    ) -> None:
+        """
+        Process one microphone chunk.
+
+        This runs on the audio thread, so keep it lightweight.
+        """
+
+        # Copy because PortAudio reuses the input buffer.
         samples = indata[:, 0].copy()
-        self.preview_buffer.append(samples)
-        with self._state_lock:
-            recording = self._recording
-        if recording:
-            self.buffer.append(samples)
 
-        # Feed live speech recognition during preview and during session recording.
-        # If overloaded, discard the oldest chunk so recognition does not lag far behind.
+        # Apply software amplification.
+        if self.input_gain != 1.0:
+            amplified = samples.astype(
+                np.float32
+            ) * self.input_gain
+
+            # Prevent int16 overflow and distortion caused by
+            # values outside the valid int16 range.
+            amplified = np.clip(
+                amplified,
+                -32768.0,
+                32767.0,
+            )
+
+            samples = amplified.astype(np.int16)
+
+        # Store the complete recording.
+        self.buffer.append(samples)
+
+        # Send the same processed samples to the speech worker.
         try:
             self.chunks.put_nowait(samples)
         except queue.Full:
-            try:
-                self.chunks.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self.chunks.put_nowait(samples)
-            except queue.Full:
-                pass
+            # If the speech worker is temporarily too slow,
+            # don't block the audio callback.
+            pass

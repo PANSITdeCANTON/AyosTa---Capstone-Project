@@ -1,0 +1,6 @@
+{
+  "algorithm": "pbkdf2_sha256",
+  "iterations": 600000,
+  "salt": "016fc2fb52bde1a791b28f3bbc2f6d43",
+  "hash": "56a24a663cc097a62712129c294924af51caf09ac8434d0d26a0e548fff91238"
+}
